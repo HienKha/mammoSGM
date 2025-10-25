@@ -510,3 +510,237 @@ def train_model(
     print(f"Training log saved to {log_file}")
     print(f"{model_name} training finished.")
     return model
+
+
+def evaluate_model_and_save_metrics(
+    model, data_loader, device="cpu", mode="Test", output_dir=None, model_info=None, criterion=None
+):
+    """
+    Evaluate model and save comprehensive metrics to CSV.
+    
+    Args:
+        model: PyTorch model to evaluate
+        data_loader: DataLoader with test data
+        device: Device to run evaluation on
+        mode: Evaluation mode (e.g., "Test", "Val")
+        output_dir: Directory to save results CSV
+        model_info: Dict with model metadata (name, dataset, etc.)
+        criterion: Loss function (defaults to CrossEntropyLoss)
+    """
+    # Multi-GPU unwrap if needed
+    if isinstance(model, nn.DataParallel):
+        model = model.module
+    model = model.to(device)
+    model.eval()
+    
+    # Initialize collections
+    all_labels = []
+    all_preds = []
+    all_probs = []
+    total_loss = 0.0
+    total = 0
+    
+    # Default criterion
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
+    
+    # Evaluation loop
+    with torch.no_grad():
+        for batch in data_loader:
+            images, labels = batch
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item() * images.size(0)
+            
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(outputs, dim=1)
+            
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            total += labels.size(0)
+    
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+    all_probs = np.array(all_probs)
+    avg_loss = total_loss / total
+    
+    # Calculate all metrics
+    metrics = {}
+    
+    # Basic metrics
+    metrics['loss'] = avg_loss
+    
+    # Calculate confusion matrix components for each class
+    unique_labels = np.unique(all_labels)
+    n_classes = len(unique_labels)
+    
+    # Initialize counters for micro-averaging
+    total_tp = 0
+    total_tn = 0
+    total_fp = 0
+    total_fn = 0
+    
+    # Store per-class metrics
+    class_metrics = {}
+    
+    for i in range(n_classes):
+        # Create binary labels for this class
+        true_binary = (all_labels == i)
+        pred_binary = (all_preds == i)
+        
+        # Calculate TP, TN, FP, FN for this class
+        tp = np.sum((true_binary) & (pred_binary))
+        fp = np.sum((~true_binary) & (pred_binary))
+        fn = np.sum((true_binary) & (~pred_binary))
+        tn = np.sum((~true_binary) & (~pred_binary))
+        
+        # Accumulate for micro-averaging
+        total_tp += tp
+        total_tn += tn
+        total_fp += fp
+        total_fn += fn
+        
+        # Store per-class metrics
+        class_metrics[f'class_{i}'] = {
+            'tp': int(tp),
+            'tn': int(tn),
+            'fp': int(fp),
+            'fn': int(fn)
+        }
+    
+    # Calculate micro metrics using total TP, TN, FP, FN
+    total_micro = total_tp + total_tn + total_fp + total_fn
+    metrics['mic_accuracy'] = (total_tp + total_tn) / total_micro if total_micro > 0 else 0
+    metrics['mic_precision'] = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    metrics['mic_recall'] = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+    metrics['mic_f1'] = 2 * metrics['mic_precision'] * metrics['mic_recall'] / \
+                       (metrics['mic_precision'] + metrics['mic_recall']) \
+                       if (metrics['mic_precision'] + metrics['mic_recall']) > 0 else 0
+    
+    # Add confusion matrix components to metrics
+    metrics['total_tp'] = int(total_tp)
+    metrics['total_tn'] = int(total_tn)
+    metrics['total_fp'] = int(total_fp)
+    metrics['total_fn'] = int(total_fn)
+    
+    # Weighted metrics (using sklearn for consistency)
+    metrics['wt_precision'] = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+    metrics['wt_recall'] = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+    metrics['wt_accuracy'] = accuracy_score(all_labels, all_preds)
+    metrics['wt_f1'] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    
+    # Add per-class metrics to the main metrics dictionary
+    metrics['per_class'] = class_metrics
+    
+    # Macro metrics
+    metrics['mac_precision'] = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+    metrics['mac_recall'] = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+    metrics['mac_accuracy'] = accuracy_score(all_labels, all_preds)
+    metrics['mac_f1'] = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    
+        # ROC-AUC and PR-AUC
+    unique_labels = np.unique(all_labels)
+    n_classes = len(unique_labels)
+    
+    try:
+        if n_classes == 2:
+            # Binary classification case
+            metrics['roc_auc'] = roc_auc_score(all_labels, all_probs[:, 1])
+            # For binary case, PR curve is between the positive class precision and recall
+            metrics['pr_auc'] = average_precision_score(all_labels, all_probs[:, 1])
+        else:
+            # Multi-class case
+            metrics['roc_auc'] = roc_auc_score(all_labels, all_probs, multi_class='ovr')
+            
+            # Calculate PR-AUC for each class and take weighted average
+            pr_aucs = []
+            weights = []
+            for i in range(n_classes):
+                # Create binary labels for this class
+                binary_labels = (all_labels == i).astype(np.int32)
+                # Get probability scores for this class
+                class_probs = all_probs[:, i]
+                # Calculate PR-AUC for this class
+                try:
+                    pr_auc = average_precision_score(binary_labels, class_probs)
+                    pr_aucs.append(pr_auc)
+                    # Use class support as weight
+                    weights.append(np.sum(binary_labels))
+                except Exception:
+                    pr_aucs.append(0.0)
+                    weights.append(0)
+            
+            # Calculate weighted average of PR-AUCs
+            if sum(weights) > 0:
+                metrics['pr_auc'] = np.average(pr_aucs, weights=weights)
+            else:
+                metrics['pr_auc'] = np.mean(pr_aucs)  # Fallback to simple average
+    except Exception:
+        metrics['roc_auc'] = np.nan
+        metrics['pr_auc'] = np.nan
+    
+    # Add extra info to metrics if available
+    # if model_info:
+    #     metrics.update(model_info)
+    # metrics['timestamp'] = datetime.now().isoformat()
+    
+    # # Save metrics to CSV if output_dir is provided
+    # if output_dir is not None and output_dir != "":
+    #     # Make sure output directory exists
+    #     os.makedirs(output_dir, exist_ok=True)
+        
+    #     # Construct file paths
+    #     results_file = os.path.join(output_dir, 'final_results.csv')
+        
+    #     # Convert metrics to DataFrame
+    #     results_df = pd.DataFrame([metrics])
+        
+    #     # Ghi metrics vào CSV - nếu file đã tồn tại thì chỉ append thêm row mới
+    #     if os.path.exists(results_file):
+    #         results_df.to_csv(results_file, mode='a', header=False, index=False)
+    #     else:
+    #         results_df.to_csv(results_file, index=False)
+            
+    #     print(f"\nResults saved to: {results_file}")
+
+    # saved_csv_file = os.path.join(output_dir, "detailed_test_metrics.csv")
+
+    # 
+
+        
+    # print(f"\nResults saved to: {saved_csv_file}")
+    
+    # Print metrics summary
+    print(f"\n{mode} Results:")
+    print("="*50)
+    print(f"Loss: {metrics['loss']:.4f}")
+    print("\nWeighted Metrics:")
+    print(f"Precision: {metrics['wt_precision']:.4f}")
+    print(f"Recall: {metrics['wt_recall']:.4f}")
+    print(f"Accuracy: {metrics['wt_accuracy']:.4f}")
+    print(f"F1-Score: {metrics['wt_f1']:.4f}")
+    
+    print("\nMicro Metrics:")
+    print(f"Precision: {metrics['mic_precision']:.4f}")
+    print(f"Recall: {metrics['mic_recall']:.4f}")
+    print(f"Accuracy: {metrics['mic_accuracy']:.4f}")
+    print(f"F1-Score: {metrics['mic_f1']:.4f}")
+    
+    print("\nMacro Metrics:")
+    print(f"Precision: {metrics['mac_precision']:.4f}")
+    print(f"Recall: {metrics['mac_recall']:.4f}")
+    print(f"Accuracy: {metrics['mac_accuracy']:.4f}")
+    print(f"F1-Score: {metrics['mac_f1']:.4f}")
+    
+    print("\nAUC Metrics:")
+    print(f"ROC-AUC: {metrics['roc_auc']:.4f}")
+    print(f"PR-AUC: {metrics['pr_auc']:.4f}")
+    
+    print("\nDetailed Classification Report:")
+    print(classification_report(all_labels, all_preds, digits=4, zero_division=0))
+    
+    return metrics
